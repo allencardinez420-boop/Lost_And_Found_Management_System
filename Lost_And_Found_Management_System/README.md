@@ -4,7 +4,7 @@ A complete PHP + MySQL starter application based on the supplied Excel workbook 
 
 ## Files
 - `index.php` — single-file application containing PHP backend, HTML, CSS, Tailwind CDN, and JavaScript.
-- `database.sql` — MySQL/phpMyAdmin database schema and starter records transcribed from the workbook.
+- `lost&found_db.sql` — MySQL/phpMyAdmin database schema and starter records transcribed from the workbook.
 - `assets/logo.jpg` — supplied system logo.
 
 ## Database flow reflected in the workbook
@@ -23,13 +23,13 @@ Workflow: Report Lost / Report Found -> Registry -> Matching -> Claim -> Admin V
 ## Install in XAMPP/WAMP/Laragon
 1. Copy this folder into your web root, for example `htdocs/lost_found_system/`.
 2. Start Apache and MySQL.
-3. Open phpMyAdmin and import `database.sql`.
-4. Check the DB constants at the top of `index.php`.
-5. Visit `http://localhost/lost_found_system/`.
+3. Open phpMyAdmin and import `lost&found_db.sql`.
+4. Check the DB constants at the top of `index.php`. The default WAMP setup uses host `127.0.0.1`, port `3307` for MariaDB, user `root`, and blank password. If your database uses another port or password, update the constants or set the `DB_PORT` and `DB_PASS` environment variables.
+5. Visit `http://localhost/Lost_And_Found_Management_System/`.
 
 ## Demo logins
-- `U001` through `U010`
-- Password: `demo123`
+- `241-0200-1`, then `U002` through `U010`
+- Password for `241-0200-1`: `allencardinez024`
 - `U004` is the Admin account.
 
 ## Notes

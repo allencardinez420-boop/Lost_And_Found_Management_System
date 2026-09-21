@@ -1,24 +1,88 @@
 <?php
 session_start();
 
-const DB_HOST = 'localhost';
+const DB_HOST = '127.0.0.1';
+const DB_PORT = '3307';
 const DB_NAME = 'lost_found_db';
 const DB_USER = 'root';
 const DB_PASS = '';
 
+function db_config(string $name, string $default): string {
+  $value = getenv($name);
+  return $value === false ? $default : $value;
+}
+
 function db(): PDO {
     static $pdo = null;
     if ($pdo instanceof PDO) return $pdo;
-    $pdo = new PDO(
-        'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4',
-        DB_USER, DB_PASS,
-        [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false,
-        ]
-    );
-    return $pdo;
+
+    $candidates = [
+        ['host' => db_config('DB_HOST', DB_HOST), 'port' => db_config('DB_PORT', DB_PORT), 'user' => db_config('DB_USER', DB_USER), 'pass' => db_config('DB_PASS', DB_PASS)],
+        ['host' => '127.0.0.1', 'port' => '3307', 'user' => 'root', 'pass' => ''],
+        ['host' => 'localhost', 'port' => '3307', 'user' => 'root', 'pass' => ''],
+        ['host' => '127.0.0.1', 'port' => '3306', 'user' => 'root', 'pass' => ''],
+        ['host' => 'localhost', 'port' => '3306', 'user' => 'root', 'pass' => ''],
+        ['host' => '127.0.0.1', 'port' => '3306', 'user' => 'root', 'pass' => 'root'],
+        ['host' => 'localhost', 'port' => '3306', 'user' => 'root', 'pass' => 'root'],
+        ['host' => '127.0.0.1', 'port' => '3307', 'user' => 'root', 'pass' => 'root'],
+        ['host' => '127.0.0.1', 'port' => '3308', 'user' => 'root', 'pass' => ''],
+    ];
+
+    $dbName = db_config('DB_NAME', DB_NAME);
+    $lastException = null;
+
+    $seen = [];
+    $uniqueCandidates = [];
+    foreach ($candidates as $c) {
+        $key = "{$c['host']}:{$c['port']}:{$c['user']}:{$c['pass']}";
+        if (!isset($seen[$key])) {
+            $seen[$key] = true;
+            $uniqueCandidates[] = $c;
+        }
+    }
+
+    foreach ($uniqueCandidates as $cand) {
+        try {
+            $dsn = "mysql:host={$cand['host']};port={$cand['port']};dbname={$dbName};charset=utf8mb4";
+            $conn = new PDO($dsn, $cand['user'], $cand['pass'], [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                PDO::ATTR_TIMEOUT => 2,
+            ]);
+            $conn->query('SELECT 1');
+            $pdo = $conn;
+            return $pdo;
+        } catch (Throwable $e) {
+            $lastException = $e;
+        }
+    }
+
+    // Try without dbname to auto-create lost_found_db if missing
+    foreach ($uniqueCandidates as $cand) {
+        try {
+            $dsn = "mysql:host={$cand['host']};port={$cand['port']};charset=utf8mb4";
+            $conn = new PDO($dsn, $cand['user'], $cand['pass'], [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                PDO::ATTR_TIMEOUT => 2,
+            ]);
+            $conn->exec("CREATE DATABASE IF NOT EXISTS `{$dbName}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            $conn->exec("USE `{$dbName}`");
+            $tableCount = (int)$conn->query("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='{$dbName}'")->fetchColumn();
+            if ($tableCount === 0 && file_exists(__DIR__ . '/lost&found_db.sql')) {
+                $sql = file_get_contents(__DIR__ . '/lost&found_db.sql');
+                $conn->exec($sql);
+            }
+            $pdo = $conn;
+            return $pdo;
+        } catch (Throwable $e) {
+            $lastException = $e;
+        }
+    }
+
+    throw $lastException ?? new RuntimeException('Unable to connect to database on any detected port.');
 }
 function e(?string $value): string { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
 function redirect(string $page = 'home', array $query = []): never {
@@ -35,6 +99,21 @@ function is_logged_in(): bool { return user() !== null; }
 function is_admin(): bool { return in_array(user()['role'] ?? '', ['Admin'], true); }
 function require_login(): void { if (!is_logged_in()) { flash('error', 'Please sign in first.'); redirect('login'); } }
 function require_admin(): void { if (!is_admin()) { flash('error', 'Admin access required.'); redirect('dashboard'); } }
+function migrate_legacy_user_id(): void {
+  $pdo = db();
+  $legacyId = '241-0200-1';
+  $newId = 'U001';
+  $legacy = $pdo->prepare('SELECT user_id FROM users WHERE user_id=?');
+  $legacy->execute([$legacyId]);
+  if (!$legacy->fetchColumn()) return;
+
+  $current = $pdo->prepare('SELECT user_id FROM users WHERE user_id=?');
+  $current->execute([$newId]);
+  if ($current->fetchColumn()) return;
+
+  $pdo->prepare('UPDATE users SET user_id=? WHERE user_id=?')->execute([$newId, $legacyId]);
+  if (($_SESSION['user']['user_id'] ?? '') === $legacyId) $_SESSION['user']['user_id'] = $newId;
+}
 function next_id(string $prefix, string $column, string $table): string {
     $stmt = db()->query("SELECT MAX(CAST(SUBSTRING($column, 2) AS UNSIGNED)) AS m FROM $table");
     $max = (int)($stmt->fetch()['m'] ?? 0);
@@ -95,6 +174,7 @@ function flash_toast(?array $flash = null): void {
 
 // ---------- actions ----------
 try {
+  migrate_legacy_user_id();
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         verify_csrf();
         $action = $_POST['action'] ?? '';
@@ -155,12 +235,19 @@ try {
             $it = db()->prepare("SELECT * FROM found_item_records WHERE found_id=? AND status='Unclaimed'");
             $it->execute([$fid]); $row = $it->fetch();
             if (!$row) { flash('error', 'That item is no longer available.'); redirect('found'); }
-            $c = db()->prepare('SELECT COUNT(*) FROM claim_records WHERE found_id=? AND user_id=?');
+            $c = db()->prepare('SELECT claim_id,status FROM claim_records WHERE found_id=? AND user_id=? LIMIT 1');
             $c->execute([$fid, user()['user_id']]);
-            if ((int)$c->fetchColumn() > 0) { flash('error', 'You already have a claim for this item.'); redirect('claims'); }
-            $cid = next_id('C','claim_id','claim_records');
-            db()->prepare('INSERT INTO claim_records (claim_id,found_id,user_id,date_claimed,verified_by,status) VALUES (?,?,?,?,NULL,?)')
+            $existingClaim = $c->fetch();
+            if ($existingClaim && $existingClaim['status'] !== 'Rejected') { flash('error', 'You already have a claim for this item.'); redirect('claims'); }
+            if ($existingClaim) {
+              $cid = $existingClaim['claim_id'];
+              db()->prepare("UPDATE claim_records SET date_claimed=?, verified_by=NULL, status='Pending' WHERE claim_id=?")
+                ->execute([date('Y-m-d'), $cid]);
+            } else {
+              $cid = next_id('C','claim_id','claim_records');
+              db()->prepare('INSERT INTO claim_records (claim_id,found_id,user_id,date_claimed,verified_by,status) VALUES (?,?,?,?,NULL,?)')
                 ->execute([$cid, $fid, user()['user_id'], date('Y-m-d'), 'Pending']);
+            }
             flash('success', 'Claim submitted for verification.'); redirect('claims');
         }
         if ($action === 'claim_review') {
@@ -201,7 +288,7 @@ try {
     if (!is_logged_in() && in_array($page, app_pages(), true) && !in_array($page, ['login','home'], true)) { flash('error', 'Please sign in first.'); redirect('login'); }
     $st = stats();
 } catch (Throwable $ex) {
-    $flash = ['type'=>'error','message'=>'Database connection failed. Import lost&found_db.sql into phpMyAdmin, then check DB settings.'];
+  $flash = ['type'=>'error','message'=>'Database connection failed: ' . $ex->getMessage() . ' Import lost&found_db.sql and set DB_PASS if your MySQL root account has a password.'];
     $page = 'setup-help';
     $st = ['lost_total'=>0,'found_total'=>0,'unclaimed_total'=>0,'approved_total'=>0,'pending_total'=>0,'users_total'=>0];
 }
@@ -301,13 +388,13 @@ tailwind.config = { theme: { extend: { colors: { navy:'#173B68', blue:'#1D63B8',
       ['dashboard','Dashboard','M3 12l9-9 9 9M5 10v10a1 1 0 001 1h3m10-11v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6'],
     ],
     'Records' => [
+      ['users','Users','M16 11a4 4 0 10-8 0 4 4 0 008 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z'],
       ['lost','Lost Records','M12 8v4l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z'],
-      ['found','Found Items','M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z'],
+      ['found','Found Item Records','M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z'],
       ['claims','Claim Records','M3 8l9 6 9-6M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z'],
       ['matching','Matching','M4 6h16M4 12h16M4 18h7'],
     ],
     'Users & Management' => $isAdmin ? [
-      ['users','Users','M16 11a4 4 0 10-8 0 4 4 0 008 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z'],
       ['departments','Departments','M3 7h18M3 12h18M3 17h18'],
     ] : [],
     'Reports' => [
@@ -403,7 +490,7 @@ tailwind.config = { theme: { extend: { colors: { navy:'#173B68', blue:'#1D63B8',
                 <?php if ($notifUnclaimedFound): ?>
                   <div class="p-2 bg-slate-50/30">
                     <div class="flex items-center justify-between px-2.5 py-1">
-                      <span class="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Unclaimed Found Items (<?=$unclaimedFoundCount?>)</span>
+                      <span class="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Unclaimed Found Item Records (<?=$unclaimedFoundCount?>)</span>
                       <a href="index.php?page=found&status=Unclaimed" class="text-[11px] font-bold text-blue hover:underline">View all →</a>
                     </div>
                     <?php foreach ($notifUnclaimedFound as $uf): ?>
@@ -435,7 +522,7 @@ tailwind.config = { theme: { extend: { colors: { navy:'#173B68', blue:'#1D63B8',
               </div>
               <div class="border-t border-slate-100 p-2 bg-slate-50/60 flex justify-between gap-2">
                 <a href="index.php?page=claims" class="btn btn-soft w-full justify-center text-xs py-1.5">Go to Claim Records</a>
-                <a href="index.php?page=found" class="btn btn-ghost w-full justify-center text-xs py-1.5">Found Items</a>
+                <a href="index.php?page=found" class="btn btn-ghost w-full justify-center text-xs py-1.5">Found Item Records</a>
               </div>
             </div>
           </div>
@@ -460,6 +547,7 @@ tailwind.config = { theme: { extend: { colors: { navy:'#173B68', blue:'#1D63B8',
     <div id="sidebarBackdrop" class="fixed inset-0 z-30 hidden bg-slate-900/40 lg:hidden"></div>
     <main class="px-4 py-6 lg:px-8">
 <?php else: ?>
+<?php if ($page !== 'login'): ?>
 <header class="sticky top-0 z-50 border-b border-slate-200/80 bg-white/90 backdrop-blur">
   <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 lg:px-8">
     <a href="index.php?page=home" class="flex items-center gap-3">
@@ -467,16 +555,16 @@ tailwind.config = { theme: { extend: { colors: { navy:'#173B68', blue:'#1D63B8',
       <div class="leading-tight hidden sm:block"><div class="font-black text-navy">LOST & FOUND</div><div class="text-xs font-bold uppercase tracking-[.18em] text-slate-500">Management System</div></div>
     </a>
     <nav class="flex items-center gap-1">
-      <a href="index.php?page=home" class="rounded-xl px-3 py-2 text-sm font-semibold <?=$page==='home'?'bg-sky text-blue':'text-slate-600 hover:bg-slate-50'?>">Home</a>
       <?php if(is_logged_in()): ?>
         <a href="index.php?page=dashboard" class="rounded-xl px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50">Dashboard</a>
         <form method="post" class="ml-2"><input type="hidden" name="csrf" value="<?=e(csrf_token())?>"><input type="hidden" name="action" value="logout"><button class="rounded-xl bg-navy px-4 py-2 text-sm font-bold text-white">Sign out</button></form>
       <?php else: ?>
-        <a href="index.php?page=login" class="ml-2 rounded-xl bg-navy px-4 py-2 text-sm font-bold text-white">Sign in</a>
+        <a id="publicSignInLink" href="index.php?page=login" class="ml-2 rounded-xl bg-navy px-4 py-2 text-sm font-bold text-white">Sign in</a>
       <?php endif; ?>
     </nav>
   </div>
 </header>
+<?php endif; ?>
 <main class="mx-auto max-w-7xl px-4 py-10 lg:px-8">
 <?php endif; ?>
 <?php flash_toast($flash); ?>
@@ -549,6 +637,41 @@ function layout_footer(): void { ?>
       }
     });
   });
+  const signInPanel=document.getElementById('signInPanel'), registerPanel=document.getElementById('registerPanel');
+  const showRegister=document.getElementById('showRegister'), showSignIn=document.getElementById('showSignIn');
+  const publicSignInLink=document.getElementById('publicSignInLink');
+  const loginPassword=document.getElementById('loginPassword'), toggleLoginPassword=document.getElementById('toggleLoginPassword'), loginPasswordIcon=document.getElementById('loginPasswordIcon');
+  const loginUserId=document.getElementById('loginUserId');
+  const toggleAuthPanel=(register)=>{
+    if(signInPanel) signInPanel.classList.toggle('hidden', register);
+    if(registerPanel) registerPanel.classList.toggle('hidden', !register);
+    if(publicSignInLink) publicSignInLink.classList.toggle('hidden', register);
+  };
+  const registerContact=document.getElementById('registerContact'), registerPassword=document.getElementById('registerPassword');
+  const clearAuthFields=()=>{
+    if(loginUserId) loginUserId.value='';
+    if(loginPassword) loginPassword.value='';
+    if(registerContact) registerContact.value='';
+    if(registerPassword) registerPassword.value='';
+  };
+  clearAuthFields();
+  if(showRegister) showRegister.addEventListener('click',()=>{ clearAuthFields(); toggleAuthPanel(true); });
+  if(showSignIn) showSignIn.addEventListener('click',()=>toggleAuthPanel(false));
+  if(loginUserId && loginPassword){
+    loginUserId.value='';
+    loginPassword.value='';
+  }
+  if(loginPassword && toggleLoginPassword){
+    toggleLoginPassword.addEventListener('click',()=>{
+      const visible=loginPassword.type==='text';
+      loginPassword.type=visible?'password':'text';
+      toggleLoginPassword.setAttribute('aria-label',visible?'Show password':'Hide password');
+      toggleLoginPassword.title=visible?'Show password':'Hide password';
+      if(loginPasswordIcon) loginPasswordIcon.innerHTML=visible
+        ? '<path d="M2.06 12.35a1 1 0 0 1 0-.7C3.7 7.56 7.53 5 12 5s8.3 2.56 9.94 6.65a1 1 0 0 1 0 .7C20.3 16.44 16.47 19 12 19s-8.3-2.56-9.94-6.65Z"/><circle cx="12" cy="12" r="3"/>'
+        : '<path d="m3 3 18 18"/><path d="M10.58 10.58a2 2 0 0 0 2.83 2.83"/><path d="M9.9 4.24A10.8 10.8 0 0 1 12 4c4.47 0 8.3 2.56 9.94 6.65a1 1 0 0 1 0 .7 10.8 10.8 0 0 1-4.03 4.72"/><path d="M6.61 6.61A10.8 10.8 0 0 0 2.06 11.65a1 1 0 0 0 0 .7C3.7 16.44 7.53 19 12 19c1.06 0 2.08-.15 3.03-.43"/>';
+    });
+  }
 })();
 </script>
 </body></html>
@@ -572,43 +695,47 @@ if ($page === 'home'):
   </div>
 </section>
 <?php elseif ($page === 'login'): ?>
-<div class="grid min-h-[80vh] place-items-center px-4 py-10">
-  <div class="grid w-full max-w-5xl gap-6 lg:grid-cols-2">
-    <div class="card overflow-hidden p-0">
-      <div class="grid h-full place-items-center bg-gradient-to-br from-navy to-blue p-10 text-white">
+<div class="-mx-4 -my-10 flex min-h-[calc(100vh-4.5rem)] flex-col items-center justify-center gap-0 px-4 py-10 lg:mx-0 lg:my-0 lg:min-h-[80vh]">
+  <div class="flex w-full max-w-xl flex-col gap-[50px]">
+    <div class="overflow-hidden rounded-2xl shadow-soft bg-gradient-to-br from-navy to-blue p-8 text-white sm:p-10">
         <div class="text-center">
-          <img src="assets/logo.jpg" alt="Lost & Found logo" class="mx-auto h-32 w-32 rounded-3xl object-cover shadow-lg ring-4 ring-white/20">
-          <div class="mt-6 text-2xl font-black tracking-wide">LOST &amp; FOUND</div>
+          <img src="assets/logo.jpg" alt="Lost & Found logo" class="mx-auto h-24 w-24 rounded-3xl object-cover shadow-lg ring-4 ring-white/20 lg:h-32 lg:w-32">
+          <div class="mt-4 text-xl font-black tracking-wide lg:mt-6 lg:text-2xl">LOST &amp; FOUND</div>
           <div class="text-xs font-bold uppercase tracking-[.28em] text-white/80">Management System</div>
-          <p class="mx-auto mt-4 max-w-xs text-sm text-white/80">Find it. Report it. Get it back.</p>
+          <p class="mx-auto mt-3 max-w-xs text-sm text-white/80 lg:mt-4">Find it. Report it. Get it back.</p>
         </div>
-      </div>
     </div>
-    <div class="card p-8">
-      <h1 class="text-2xl font-black text-navy">Sign in</h1>
+    <div id="authCard" class="rounded-2xl bg-white px-4 pb-6 pt-8 shadow-soft sm:p-8">
+      <div id="signInPanel">
+      <h1 class="text-xl font-black text-navy lg:text-2xl">Sign in</h1>
       <p class="mt-1 text-sm text-slate-500">Use a registered account to continue.</p>
-      <form method="post" class="mt-6 space-y-4">
+      <form method="post" autocomplete="off" class="mt-5 space-y-3 lg:mt-6 lg:space-y-4">
         <input type="hidden" name="csrf" value="<?=e(csrf_token())?>">
         <input type="hidden" name="action" value="login">
-        <div><label class="block text-xs font-bold uppercase tracking-wide text-slate-600">User ID</label><input name="user_id" required class="input mt-1" placeholder="e.g. U001"></div>
-        <div><label class="block text-xs font-bold uppercase tracking-wide text-slate-600">Password</label><input type="password" name="password" required class="input mt-1" placeholder="Enter your password"></div>
-        <button class="btn btn-primary w-full justify-center">Sign in</button>
+        <div><label class="block text-[10px] font-bold uppercase tracking-wide text-slate-600 lg:text-xs">User ID</label><input id="loginUserId" name="user_id" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" required class="input mt-1 py-1.5 text-xs lg:py-2 lg:text-sm" placeholder="Enter your user ID"></div>
+        <div><label class="block text-[10px] font-bold uppercase tracking-wide text-slate-600 lg:text-xs">Password</label><div class="relative mt-1"><input id="loginPassword" type="password" name="password" autocomplete="new-password" readonly onfocus="this.removeAttribute('readonly')" required class="input py-1.5 pr-12 text-xs lg:py-2 lg:text-sm" placeholder="Enter your password"><button type="button" id="toggleLoginPassword" class="absolute inset-y-0 right-0 grid w-10 place-items-center text-slate-400 hover:text-blue lg:w-12" aria-label="Show password" title="Show password"><svg id="loginPasswordIcon" class="h-4 w-4 lg:h-5 lg:w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.06 12.35a1 1 0 0 1 0-.7C3.7 7.56 7.53 5 12 5s8.3 2.56 9.94 6.65a1 1 0 0 1 0 .7C20.3 16.44 16.47 19 12 19s-8.3-2.56-9.94-6.65Z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+        <button class="btn btn-primary w-full justify-center py-1.5 text-xs lg:py-2 lg:text-sm">Sign in</button>
       </form>
       <div class="mt-6 border-t border-slate-200 pt-4">
-        <details><summary class="cursor-pointer text-sm font-bold text-blue">Create a new account</summary>
-          <form method="post" class="mt-4 space-y-3">
+        <button type="button" id="showRegister" class="text-sm font-bold text-blue">Create a new account</button>
+      </div>
+      </div>
+      <div id="registerPanel" class="hidden">
+          <h1 class="text-2xl font-black text-navy">Create an account</h1>
+          <p class="mt-1 text-sm text-slate-500">Register your account to continue.</p>
+          <form method="post" autocomplete="off" class="mt-4 space-y-2">
             <input type="hidden" name="csrf" value="<?=e(csrf_token())?>">
             <input type="hidden" name="action" value="register">
-            <input name="name" required class="input" placeholder="Full name">
+            <input name="name" required class="input py-1.5" placeholder="Full name">
             <div class="grid grid-cols-2 gap-2">
-              <select name="role" class="input"><option>Student</option><option>Instructor</option><option>Employee</option><option>Outsider</option></select>
-              <input name="department" class="input" placeholder="Department">
+              <select name="role" class="input py-1.5"><option>Student</option><option>Instructor</option><option>Employee</option><option>Outsider</option></select>
+              <input name="department" class="input py-1.5" placeholder="Department">
             </div>
-            <input name="contact" class="input" placeholder="Contact">
-            <input type="password" name="password" minlength="6" required class="input" placeholder="Password (6+ chars)">
-            <button class="btn btn-soft w-full justify-center">Create account</button>
+            <input id="registerContact" name="contact" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" class="input py-1.5" placeholder="Contact">
+            <input id="registerPassword" type="password" name="password" autocomplete="new-password" readonly onfocus="this.removeAttribute('readonly')" minlength="6" required class="input py-1.5" placeholder="Password (6+ chars)">
+            <button class="btn btn-soft w-full justify-center py-1.5">Create account</button>
           </form>
-        </details>
+          <button type="button" id="showSignIn" class="mt-4 text-sm font-bold text-blue">Back to sign in</button>
       </div>
     </div>
   </div>
@@ -623,7 +750,7 @@ if ($page === 'home'):
   <?php
   $cards = [
     ['Lost Records', (int)$st['lost_total'], 'Reported items awaiting match', 'lost', 'stat-blue', '#1D63B8', 'M12 8v4l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z'],
-    ['Found Items', (int)$st['found_total'], (int)$st['unclaimed_total'].' unclaimed', 'found', 'stat-green', '#10b981', 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z'],
+    ['Found Item Records', (int)$st['found_total'], (int)$st['unclaimed_total'].' unclaimed', 'found', 'stat-green', '#10b981', 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z'],
     ['Claim Records', (int)$st['approved_total'] + (int)$st['pending_total'], (int)$st['pending_total'].' pending review', 'claims', 'stat-orange', '#f59e0b', 'M3 8l9 6 9-6M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z'],
     ['Users', (int)$st['users_total'], 'Registered accounts', is_admin() ? 'users' : 'settings', 'stat-violet', '#8b5cf6', 'M16 11a4 4 0 10-8 0 4 4 0 008 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z'],
   ];
@@ -658,7 +785,7 @@ if ($page === 'home'):
     </div>
   </div>
   <div class="card p-5">
-    <div class="flex items-center justify-between"><h3 class="text-base font-black text-navy">Recent Found Items</h3><a href="index.php?page=found" class="text-xs font-bold text-blue">View all →</a></div>
+    <div class="flex items-center justify-between"><h3 class="text-base font-black text-navy">Recent Found Item Records</h3><a href="index.php?page=found" class="text-xs font-bold text-blue">View all →</a></div>
     <div class="mt-3 overflow-x-auto scrollbar-thin">
       <table class="table w-full text-left"><thead><tr class="border-b border-slate-100"><th class="py-2 pr-3">Item</th><th class="py-2 pr-3">Category</th><th class="py-2 pr-3">Date</th><th class="py-2 pr-3">Location</th><th class="py-2 pr-3">Status</th></tr></thead>
         <tbody>
@@ -700,7 +827,7 @@ if ($page === 'home'):
       labels: <?=json_encode($series['labels'])?>,
       datasets: [
         { label:'Lost Items', data: <?=json_encode($series['lost'])?>, borderColor:'#1D63B8', backgroundColor:'rgba(29,99,184,.12)', tension:.3, fill:true, pointRadius:2, pointHoverRadius:4 },
-        { label:'Found Items', data: <?=json_encode($series['found'])?>, borderColor:'#10b981', backgroundColor:'rgba(16,185,129,.10)', tension:.3, fill:true, pointRadius:2, pointHoverRadius:4 },
+        { label:'Found Item Records', data: <?=json_encode($series['found'])?>, borderColor:'#10b981', backgroundColor:'rgba(16,185,129,.10)', tension:.3, fill:true, pointRadius:2, pointHoverRadius:4 },
         { label:'Claims', data: <?=json_encode($series['claims'])?>, borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,.10)', tension:.3, fill:true, pointRadius:2, pointHoverRadius:4 },
       ]
     },
@@ -731,7 +858,7 @@ if ($page === 'home'):
   if ($q !== '') {
     $sql .= ' AND (l.item_name LIKE ? OR c.category_name LIKE ? OR l.color LIKE ? OR l.location_lost LIKE ? OR l.lost_id LIKE ? OR u.name LIKE ?)';
     $like = "%$q%";
-    $params = [$like, $like, $like, $like, $like, $like];
+    $params = array_merge($params, [$like, $like, $like, $like, $like, $like]);
   }
   if (in_array($status, ['Pending','Matched','Returned'], true)) { $sql .= ' AND l.status=?'; $params[] = $status; }
   $sql .= ' ORDER BY l.created_at DESC, l.lost_id DESC';
@@ -799,8 +926,8 @@ if ($page === 'home'):
 <?php elseif ($page === 'found'):
   require_login();
   $q = trim($_GET['q'] ?? ''); $status = $_GET['status'] ?? '';
-  $sql = "SELECT f.*,c.category_name,u.name AS reporter FROM found_item_records f JOIN categories c ON c.category_id=f.category_id JOIN users u ON u.user_id=f.user_id WHERE 1=1";
-  $params = [];
+  $sql = "SELECT f.*,c.category_name,u.name AS reporter,my_claim.status AS user_claim_status FROM found_item_records f JOIN categories c ON c.category_id=f.category_id JOIN users u ON u.user_id=f.user_id LEFT JOIN claim_records my_claim ON my_claim.found_id=f.found_id AND my_claim.user_id=? WHERE 1=1";
+  $params = [user()['user_id']];
   if ($q !== '') {
     $sql .= ' AND (f.item_name LIKE ? OR c.category_name LIKE ? OR f.color LIKE ? OR f.location_found LIKE ? OR f.found_id LIKE ? OR u.name LIKE ?)';
     $like = "%$q%";
@@ -812,7 +939,7 @@ if ($page === 'home'):
 ?>
 <div class="card p-5">
   <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-    <div><h1 class="text-2xl font-black text-navy">Found Items</h1><p class="text-sm text-slate-500">All found property in the registry.</p></div>
+    <div><h1 class="text-2xl font-black text-navy">Found Item Records</h1><p class="text-sm text-slate-500">All found property in the registry.</p></div>
     <a href="index.php?page=report-found" class="btn btn-primary">+ Add Found Record</a>
   </div>
   <form method="get" action="index.php" class="mt-4 grid gap-3 sm:grid-cols-[1fr_180px_auto_auto]">
@@ -842,8 +969,10 @@ if ($page === 'home'):
         <td class="px-4 py-3"><?=status_badge($r['status'])?></td>
         <td class="px-4 py-3 text-right">
           <div class="flex justify-end gap-2">
-            <?php if ($r['status'] === 'Unclaimed'): ?>
+            <?php if ($r['status'] === 'Unclaimed' && $r['user_claim_status'] !== 'Approved'): ?>
               <form method="post" data-confirm="Submit a claim for this item?"><input type="hidden" name="csrf" value="<?=e(csrf_token())?>"><input type="hidden" name="action" value="claim"><input type="hidden" name="found_id" value="<?=e($r['found_id'])?>"><button class="btn btn-primary">Claim</button></form>
+            <?php elseif ($r['user_claim_status'] === 'Approved'): ?>
+              <span class="text-xs font-semibold text-emerald-600">Claim approved</span>
             <?php else: ?>
               <span class="text-xs text-slate-400">Already claimed</span>
             <?php endif; ?>
@@ -962,7 +1091,7 @@ if ($page === 'home'):
   foreach ($lost as $l) foreach ($found as $f) { $s = match_score($l, $f); if ($s >= 60) $pairs[] = ['score'=>$s, 'lost'=>$l, 'found'=>$f]; }
   usort($pairs, fn($a,$b) => $b['score'] <=> $a['score']);
 ?>
-<div class="card p-5"><h1 class="text-2xl font-black text-navy">Lost vs Found Matching</h1><p class="text-sm text-slate-500">Compares item name, category, color, and location. Higher percentage = stronger match.</p></div>
+<div class="card p-5"><h1 class="text-2xl font-black text-navy">Lost and Found Matching</h1><p class="text-sm text-slate-500">Compares item name, category, color, and location. Higher percentage = stronger match.</p></div>
 <div class="mt-4 grid gap-4">
   <?php if (!$pairs): ?>
     <div class="card p-8 text-center text-slate-500">No matches above 60% confidence yet.</div>
@@ -991,7 +1120,6 @@ if ($page === 'home'):
   <?php endforeach; ?>
 </div>
 <?php elseif ($page === 'users'):
-  require_admin();
   $q = trim($_GET['q'] ?? '');
   $sql = "SELECT * FROM users WHERE 1=1"; $params=[];
   if ($q!=='') { $sql .= ' AND (user_id LIKE ? OR name LIKE ? OR role LIKE ? OR IFNULL(department,"") LIKE ? OR IFNULL(contact,"") LIKE ?)'; $like="%$q%"; $params=[$like,$like,$like,$like,$like]; }
@@ -1025,10 +1153,12 @@ if ($page === 'home'):
           <td class="px-4 py-3"><span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold bg-emerald-50 text-emerald-700">Active</span></td>
           <td class="px-4 py-3 text-slate-500 text-xs"><?=e($u['created_at'] ?? '')?></td>
           <td class="px-4 py-3 text-right">
-            <?php if ($u['user_id'] !== user()['user_id']): ?>
+            <?php if (is_admin() && $u['user_id'] !== user()['user_id']): ?>
               <form method="post" data-confirm="Delete user <?=e($u['user_id'])?>?"><input type="hidden" name="csrf" value="<?=e(csrf_token())?>"><input type="hidden" name="action" value="delete_user"><input type="hidden" name="user_id" value="<?=e($u['user_id'])?>"><button class="btn btn-danger">Delete</button></form>
-            <?php else: ?>
+            <?php elseif ($u['user_id'] === user()['user_id']): ?>
               <span class="text-xs text-slate-400">You</span>
+            <?php else: ?>
+              <a href="index.php?page=profile&user_id=<?=urlencode($u['user_id'])?>" class="text-xs font-semibold text-blue hover:underline">View</a>
             <?php endif; ?>
           </td>
         </tr>
@@ -1079,9 +1209,9 @@ if ($page === 'home'):
 <div class="card p-5"><div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between"><div><h1 class="text-2xl font-black text-navy">Reports</h1><p class="text-sm text-slate-500">Live analytics from the database.</p></div><button onclick="window.print()" class="btn btn-soft">Export / Print</button></div></div>
 <div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-2">
   <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Lost Items by Category</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cLost"></canvas></div></div>
-  <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Found Items by Category</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cFound"></canvas></div></div>
+  <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Found Item Records by Category</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cFound"></canvas></div></div>
   <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Claims by Status</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cClaims"></canvas></div></div>
-  <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Monthly Lost vs Found</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cMonthly"></canvas></div></div>
+  <div class="card min-w-0 p-5"><h3 class="font-black text-navy">Monthly Lost and Found</h3><div class="relative mt-4 h-72 w-full overflow-hidden"><canvas id="cMonthly"></canvas></div></div>
 </div>
 <script>
 (function(){
@@ -1120,7 +1250,14 @@ if ($page === 'home'):
   <?php foreach ($logs as $l): ?><tr><td class="px-4 py-3 text-slate-500 text-xs"><?=e($l['created_at'])?></td><td class="px-4 py-3 font-bold text-blue"><?=e($l['claim_id'])?></td><td class="px-4 py-3"><?=e($l['item_name'])?></td><td class="px-4 py-3"><?=status_badge($l['status'])?></td><td class="px-4 py-3"><?=e($l['actor'] ?? '—')?></td></tr><?php endforeach; if (!$logs): ?><tr><td colspan="5" class="px-4 py-12 text-center text-slate-500">No activity yet.</td></tr><?php endif; ?>
 </tbody></table></div></div>
 <?php elseif ($page === 'profile'):
+  $profileId = trim($_GET['user_id'] ?? '');
   $u = user();
+  if ($profileId !== '' && $profileId !== ($u['user_id'] ?? '')) {
+    $profileStmt = db()->prepare('SELECT user_id,name,role,department,contact,created_at FROM users WHERE user_id=?');
+    $profileStmt->execute([$profileId]);
+    $viewedUser = $profileStmt->fetch();
+    if ($viewedUser) $u = $viewedUser;
+  }
 ?>
 <div class="card p-6">
   <div class="flex items-center gap-4">
@@ -1149,7 +1286,7 @@ if ($page === 'home'):
       <div><h2 class="text-sm font-bold uppercase tracking-wider text-slate-500">Appearance</h2></div>
       <label class="block text-sm font-semibold text-slate-700">Theme<input class="input mt-1" value="Light" disabled></label>
       <label class="block text-sm font-semibold text-slate-700">Default landing page
-        <select class="input mt-1"><option>Dashboard</option><option>Found Items</option><option>Lost Records</option></select>
+        <select class="input mt-1"><option>Dashboard</option><option>Found Item Records</option><option>Lost Records</option></select>
       </label>
       <button class="btn btn-soft" onclick="alert('Saved locally (demo).')">Save preferences</button>
     </div>
@@ -1189,7 +1326,7 @@ if ($page === 'home'):
   </div>
 </div>
 <?php elseif ($page === 'report-lost' || $page === 'report-found'):
-  require_login(); $isLost = ($page === 'report-lost');
+  require_login(); $isLost = ($page === 'report-lost'); $categoryOptions = categories();
 ?>
 <div class="card p-6">
   <h1 class="text-2xl font-black text-navy"><?=$isLost?'Report a lost item':'Report a found item'?></h1>
@@ -1199,13 +1336,14 @@ if ($page === 'home'):
     <input type="hidden" name="action" value="<?=$isLost?'report_lost':'report_found'?>">
     <label class="block text-sm font-semibold text-slate-700 md:col-span-1">Item name<input name="item_name" required class="input mt-1" placeholder="e.g. Black leather wallet"></label>
     <label class="block text-sm font-semibold text-slate-700 md:col-span-1">Color<input name="color" class="input mt-1" placeholder="e.g. Black"></label>
+    <label class="block text-sm font-semibold text-slate-700 md:col-span-1">Category<select name="category_id" required class="input mt-1"><option value="">Select a category</option><?php foreach ($categoryOptions as $category): ?><option value="<?=e($category['category_id'])?>"><?=e($category['category_name'])?></option><?php endforeach; ?></select></label>
     <label class="block text-sm font-semibold text-slate-700 md:col-span-1">Date <?=$isLost?'lost':'found'?><input type="date" name="<?=$isLost?'date_lost':'date_found'?>" value="<?=date('Y-m-d')?>" required class="input mt-1"></label>
     <label class="block text-sm font-semibold text-slate-700 md:col-span-1">Location <?=$isLost?'lost':'found'?><input name="<?=$isLost?'location_lost':'location_found'?>" required class="input mt-1" placeholder="Library, cafeteria, room, parking area..."></label>
     <div class="md:col-span-2 flex justify-end gap-2"><a href="index.php?page=dashboard" class="btn btn-ghost">Cancel</a><button class="btn btn-primary"><?=$isLost?'Submit Lost Report':'Add Found Record'?></button></div>
   </form>
 </div>
 <?php elseif ($page === 'setup-help'): ?>
-<div class="card p-8"><h1 class="text-2xl font-black text-navy">Setup / database connection</h1><p class="mt-3 text-slate-600">Import <code>lost&found_db.sql</code> into phpMyAdmin, then confirm the DB constants at the top of <code>index.php</code> match your MySQL installation.</p><div class="mt-6 rounded-xl bg-slate-50 p-4 text-sm text-slate-600"><b>Default:</b> host localhost · database lost_found_db · user root · password blank.</div></div>
+<div class="card p-8"><h1 class="text-2xl font-black text-navy">Setup / database connection</h1><p class="mt-3 text-slate-600">Import <code>lost&found_db.sql</code> into phpMyAdmin, then set <code>DB_HOST</code>, <code>DB_PORT</code>, <code>DB_NAME</code>, <code>DB_USER</code>, and <code>DB_PASS</code> for your MySQL installation.</p><div class="mt-6 rounded-xl bg-slate-50 p-4 text-sm text-slate-600"><b>Default:</b> host 127.0.0.1 · port 3307 · database lost_found_db · user root · password blank.</div></div>
 <?php else: ?>
 <div class="card p-8 text-center"><h1 class="text-2xl font-black text-navy">Page not found</h1><a href="index.php?page=dashboard" class="btn btn-primary mt-4">Back to Dashboard</a></div>
 <?php endif; layout_footer(); ?>
